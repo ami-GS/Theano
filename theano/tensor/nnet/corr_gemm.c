@@ -189,8 +189,10 @@ PyArrayObject* corrMM(PyArrayObject* bottom,
                 col_dim[0], col_dim[1], col_dim[2]);
         return NULL;
     }
-
+    //
     // Define some useful variables
+    
+    
     const int bottom_stride = PyArray_STRIDES(bottom)[0]/%(n_bytes)f;
     const int top_stride = PyArray_STRIDES(top)[0]/%(n_bytes)f;
     const int K_ = col_dim[1];

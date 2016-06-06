@@ -75,29 +75,23 @@ class NormAcrossMap(Op):
             scale_data[0] = theano._asarray(o, dtype = numpy.float32)
         scale = scale_data[0]
 
-        alpha = self.alpha
-        beta = self.beta
-        size = self.size
-        x_row = x.shape[2]
-        x_col = x.shape[3]
-
         for bi in xrange(0, x.shape[0]):
             for c in xrange(0, x.shape[1]):
                 c_start = c - (size - 1) / 2
                 c_end = c_start + size
 
                 if c_start < 0:
-	            c_start = 0
-		if c_end > x.shape[1]:
-		    c_end = x.shape[1]
+                    c_start = 0
+                if c_end > x.shape[1]:
+                    c_end = x.shape[1]
 
-		for h in xrange(x_row):
-		    for w in xrange(x_col):
-		        scale[bi, c, h, w] = 1.0
-			for i in xrange(c_start, c_end):
-		            value = x[bi, i, h, w]
-			    scale[bi, c, h, w] += ((value * value * alpha)/size)
-		        zz[bi, c, h, w] = \
+                for h in xrange(x_row):
+                    for w in xrange(x_col):
+                        scale[bi, c, h, w] = 1.0
+                        for i in xrange(c_start, c_end):
+                            value = x[bi, i, h, w]
+                            scale[bi, c, h, w] += ((value * value * alpha)/size)
+                        zz[bi, c, h, w] = \
                             x[bi, c, h, w] / (scale[bi, c, h, w]**beta)
 
     def grad(self, inp, grads):
@@ -108,10 +102,16 @@ class NormAcrossMap(Op):
                                   n=self.size)(x, out[0], out[1], gz)]
 
     def c_headers(self):
-        return ['<math.h>','<mkl.h>']  ##FIXME
+        if 'icpc' in theano.config.cxx:
+            return ['<math.h>','<mkl.h>']  ##FIXME
+        else:
+            return ['<gsl/gsl_cblas.h>','<math.h>','<eigen3/Eigen/Dense>']
 
     def c_libraries(self):
-        return ['mkl_rt']  ##FIXME, what if user don't have mkl?
+        if 'icpc' in theano.config.cxx:
+            return ['mkl_rt']  ##FIXME
+        else :
+            return ['gslcblas']
 
     def c_code(self, node, name, inp, out, sub):
         x, = inp
@@ -120,6 +120,11 @@ class NormAcrossMap(Op):
         alpha = self.alpha
         beta = self.beta
         size = self.size
+
+        mkl_flag = 0
+        if 'icpc' in theano.config.cxx:
+          mkl_flag = 1
+
         d = {}
         d["x"] = x
         d["z"] = z
@@ -127,8 +132,16 @@ class NormAcrossMap(Op):
         d["beta"] = self.beta
         d["size"] = self.size
         d["scale"] = scale
+        d["mkl_flag"] = mkl_flag
         ret = """
         {
+        #if !%(mkl_flag)s
+          typedef Eigen::Map<const Eigen::VectorXf> const_map_vector_float_t;
+          typedef Eigen::Map<Eigen::VectorXf> map_vector_float_t;
+          typedef Eigen::Map<const Eigen::VectorXd> const_map_vector_double_t;
+          typedef Eigen::Map<Eigen::VectorXd> map_vector_double_t;
+        #endif
+
         int typenum = PyArray_ObjectType((PyObject*)%(x)s, 0);
         if(PyArray_NDIM(%(x)s)!=4)
         {
@@ -187,10 +200,19 @@ class NormAcrossMap(Op):
 
         for(int bi = 0; bi < x_bs; bi++)
         {
-            vsMul(x_channels * x_row * x_col, \
+            #if %(mkl_flag)s
+                vsMul(x_channels * x_row * x_col, \
                     input + bi * x_channels * x_row * x_col, \
                     input + bi * x_channels * x_row * x_col, \
                     padd_data + ((%(size)s - 1) >> 1) * x_row * x_col);
+            #else
+                map_vector_float_t(padd_data + ((%(size)s - 1) >> 1) * x_row * \
+                    x_col, x_channels * x_row * x_col) = \
+                const_map_vector_float_t(input + bi * x_channels * x_row * \
+                    x_col, x_channels * x_row * x_col).array() * \
+                const_map_vector_float_t(input + bi * x_channels * x_row * \
+                    x_col, x_channels * x_row * x_col).array();
+            #endif
 
             for(int c = 0; c < %(size)s; c++)
             {
@@ -213,8 +235,20 @@ class NormAcrossMap(Op):
                             1, sc + (bi * x_channels + c) * x_row * x_col, 1);
             }
         }
-        vsPowx(x_bs * x_channels * x_row * x_col, sc, -%(beta)s, out);
-        vsMul(x_bs * x_channels * x_row * x_col, out, input, out);
+        #if %(mkl_flag)s
+            vsPowx(x_bs * x_channels * x_row * x_col, sc, -%(beta)s, out);
+            vsMul(x_bs * x_channels * x_row * x_col, out, input, out);
+        #else
+            map_vector_float_t(out, x_bs * x_channels * x_row * x_col) = \
+            const_map_vector_float_t(sc, \
+                x_bs * x_channels * x_row * x_col).array().pow(-%(b)s);
+            map_vector_float_t(out, x_bs * x_channels * x_row * x_col) = \
+                const_map_vector_float_t(out, \
+                    x_bs * x_channels * x_row * x_col).array() * \
+                const_map_vector_float_t(input, \
+                    x_bs * x_channels * x_row * x_col).array();
+        #endif
+
         free(padd_data);
  	padd_data = NULL;
         }
@@ -258,10 +292,16 @@ class NormAcrossMapGrad(Op):
 				self.alpha, self.beta, self.size)
 
     def c_headers(self):
-        return ['<math.h>','<mkl.h>'] ##FIXME
+        if 'icpc' in theano.config.cxx:
+            return ['<math.h>','<mkl.h>'] ##FIXME
+        else:
+            return ['<gsl/gsl_cblas.h>','<eigen3/Eigen/Dense>']
 
     def c_libraries(self):
-        return ['mkl_rt'] ##FIXME
+        if 'icpc' in theano.config.cxx:
+            return ['mkl_rt']  ##FIXME
+        else :
+            return ['gslcblas']
 
     def make_node(self, x, LrnOut, scale, gz):
         assert isinstance(x, Variable) and x.ndim == 4
@@ -329,6 +369,10 @@ class NormAcrossMapGrad(Op):
 	beta = self.beta
 	size = self.size
 	d={}
+        mkl_flag = 0
+        if 'icpc' in theano.config.cxx:
+            mkl_flag = 1
+
 	d["alpha"] = alpha
 	d["x"] = x
 	d["z"] = z
@@ -336,9 +380,17 @@ class NormAcrossMapGrad(Op):
 	d["LrnOut"] = LrnOut
 	d["scale"] = scale
 	d["size"] = size
+        d["mkl_flag"] = mkl_flag
 	fail = sub['fail']
 	ret = """
         { 
+        #if !%(mkl_flag)s
+          typedef Eigen::Map<const Eigen::VectorXf> const_map_vector_float_t;
+          typedef Eigen::Map<Eigen::VectorXf> map_vector_float_t;
+          typedef Eigen::Map<const Eigen::VectorXd> const_map_vector_double_t;
+          typedef Eigen::Map<Eigen::VectorXd> map_vector_double_t;
+        #endif
+
         int typenum = PyArray_ObjectType((PyObject*)%(x)s, 0);
         if(PyArray_NDIM(%(x)s) != 4)
         {
@@ -394,36 +446,70 @@ class NormAcrossMapGrad(Op):
 	dtype_%(x)s *input =
             (dtype_%(x)s *)PyArray_GETPTR4(%(x)s, 0, 0, 0, 0); //input
 
-	vsPowx(x_bs * x_channels * x_row * x_col, scale_data, -%(beta)s, out);
-	vsMul(x_bs * x_channels * x_row * x_col, gz_ptr, out, out);
+        #if %(mkl_flag)s
+	    vsPowx(x_bs * x_channels * x_row * x_col, scale_data, -%(beta)s, out);
+	    vsMul(x_bs * x_channels * x_row * x_col, gz_ptr, out, out);
+        #else
+            map_vector_float_t(out, x_bs * x_channels * x_row * x_col) = \
+            const_map_vector_float_t(scale_data, \
+                x_bs * x_channels * x_row * x_col).array().pow(-%(b)s);
+            map_vector_float_t(out, x_bs * x_channels * x_row * x_col) = \
+                const_map_vector_float_t(gz_ptr, \
+                    x_bs * x_channels * x_row * x_col).array() * \
+                const_map_vector_float_t(out, \
+                    x_bs * x_channels * x_row * x_col).array();
+        #endif
 
 	int pre_offset = ((%(size)s - 1) >> 1) * x_row * x_col;
 	for(int n = 0; n < x_bs; n++)
 	{
-           int block_offset = n * x_channels * x_row * x_col;
+            int block_offset = n * x_channels * x_row * x_col;
 
-	   vsMul(x_channels * x_row * x_col, gz_ptr + block_offset, \
-                   lrn + block_offset, padd_data + pre_offset);
+            #if %(mkl_flag)s
+                vsMul(x_channels * x_row * x_col, gz_ptr + block_offset, \
+                    lrn + block_offset, padd_data + pre_offset);
 
-	   vsDiv(x_channels * x_row * x_col, padd_data + pre_offset, \
-                 scale_data + block_offset, padd_data + pre_offset);	 
+                vsDiv(x_channels * x_row * x_col, padd_data + pre_offset, \
+                    scale_data + block_offset, padd_data + pre_offset);	 
+            #else
+                map_vector_float_t(padd_data + pre_offset, \
+                    x_channels * x_row * x_col) = \
+                        const_map_vector_float_t(gz_ptr + block_offset, \
+                            x_channels * x_row * x_col).array() * \
+                        const_map_vector_float_t(lrn + block_offset, \
+                            x_channels * x_row * x_col).array();
+
+                map_vector_float_t(padd_data + pre_offset, \
+                    x_channels * x_row * x_col) = \
+                        const_map_vector_float_t(padd_data + pre_offset, \
+                            x_channels * x_row * x_col).array() / \
+                        const_map_vector_float_t(scale_data + block_offset, \
+                            x_channels * x_row * x_col).array();
+            #endif
 	   
-	   memset(accum_data, 0, x_row * x_col * elemSize);  
-	   
-	   for(int c = 0; c < %(size)s - 1; c++)
-	   {
-               cblas_saxpy(x_row * x_col, 1.0, \
-                       padd_data + c* x_row * x_col, 1, accum_data, 1);
-	   }
+            memset(accum_data, 0, x_row * x_col * elemSize);  
+
+            for(int c = 0; c < %(size)s - 1; c++)
+            {
+                cblas_saxpy(x_row * x_col, 1.0, \
+                        padd_data + c* x_row * x_col, 1, accum_data, 1);
+            }
 	
-	   for(int c = 0; c < x_channels; c++)
-	   {
-		cblas_saxpy(x_row * x_col, 1.0, \
+	    for(int c = 0; c < x_channels; c++)
+	    {
+	       	cblas_saxpy(x_row * x_col, 1.0, \
                         padd_data + (c + %(size)s - 1) * x_row * x_col, \
                         1, accum_data, 1);
 
+            #if %(mkl_flag)s
 		vsMul(x_row * x_col, input + block_offset + c * x_row * x_col,\
                         accum_data, accum_bottom);
+            #else
+                map_vector_float_t(accum_bottom, x_row * x_col) = \
+                    const_map_vector_float_t(input + block_offset + \
+                        c * x_row * x_col, x_row * x_col).array() * \
+                    const_map_vector_float_t(accum_data, x_row * x_col).array();
+            #endif
 
 		cblas_saxpy(x_row * x_col, \
                         -2.0 * %(alpha)s * %(beta)s / %(size)s, \

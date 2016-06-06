@@ -5,14 +5,13 @@ The `Op` class is the base interface for all operations
 compatible with `gof`'s :doc:`graph` routines.
 
 """
-from __future__ import absolute_import, print_function, division
-
 import inspect
 import logging
 import numpy
 import os
 import re
 import sys
+import traceback
 import warnings
 
 import theano
@@ -20,6 +19,7 @@ from theano import config
 
 import theano.gof.cc
 from six import itervalues
+from six.moves import StringIO
 from theano.gof import graph
 from theano.gof import utils
 from theano.gof.cmodule import GCC_compiler
@@ -552,7 +552,16 @@ class PureOp(object):
                 detailed_err_msg = (
                     "For compute_test_value, one input test value does not"
                     " have the requested type.\n")
-                detailed_err_msg += utils.get_variable_trace_string(v)
+                tr = getattr(v.tag, 'trace', [])
+                if isinstance(tr, list) and len(tr) > 0:
+                    detailed_err_msg += (
+                        " \nBacktrace when that variable is created:\n")
+                    # Print separate message for each element in the list
+                    # of batcktraces
+                    sio = StringIO()
+                    for subtr in tr:
+                        traceback.print_list(subtr, sio)
+                    detailed_err_msg += str(sio.getvalue())
 
                 detailed_err_msg += (
                     "\nThe error when converting the test value to that"
@@ -564,8 +573,8 @@ class PureOp(object):
                 e.args = ("\n".join(args),)
                 raise
             return ret
-        detailed_err_msg = utils.get_variable_trace_string(v)
-        raise AttributeError('%s has no test value %s' % (v, detailed_err_msg))
+
+        raise AttributeError('%s has no test value' % v)
 
     def __call__(self, *inputs, **kwargs):
         """
@@ -619,11 +628,9 @@ class PureOp(object):
                             (i, ins, node), stacklevel=2)
                         run_perform = False
                     elif config.compute_test_value == 'raise':
-                        detailed_err_msg = utils.get_variable_trace_string(ins)
-
                         raise ValueError(
-                            'Cannot compute test value: input %i (%s) of Op %s missing default value. %s' %
-                            (i, ins, node, detailed_err_msg))
+                            'Cannot compute test value: input %i (%s) of Op %s missing default value' %
+                            (i, ins, node))
                     elif config.compute_test_value == 'ignore':
                         # silently skip test
                         run_perform = False
@@ -956,14 +963,8 @@ class Op(utils.object2, PureOp, CLinkerOp):
                                      compute_map=compute_map)
         if new_node is not None:
             node = new_node
-        if not hasattr(self, '_op_use_c_code'):
-            warnings.warn(
-                "The  __getstate__ method of '%s' is not implemented correctly."
-                " It should keep the attributes added by the base class."
-                " To implement it correctly, it should keep all attributes"
-                " and only remove those it does not want." % (self),
-                stacklevel=2)
-        if getattr(self, '_op_use_c_code', theano.config.cxx):
+
+        if self._op_use_c_code:
             try:
                 return self.make_c_thunk(node, storage_map, compute_map,
                                          no_recycling)
@@ -1167,7 +1168,10 @@ class OpenMPOp(Op):
     def c_compile_args(self):
         self.update_self_openmp()
         if self.openmp:
-            return ['-fopenmp']
+            if 'icpc' in theano.config.cxx:
+                return ['-qopenmp']
+            else:
+                return ['-fopenmp']
         return []
 
     def c_headers(self):
@@ -1192,7 +1196,7 @@ int main( int argc, const char* argv[] )
         default_openmp = GCC_compiler.try_compile_tmp(
             src_code=code,
             tmp_prefix='test_omp_',
-            flags=['-fopenmp'],
+            flags=['-qopenmp'] if 'icpc' in theano.config.cxx else ['-fopenmp'],
             try_run=False)
         return default_openmp
 
@@ -1422,7 +1426,7 @@ class COp(Op):
             # Extract the various properties of the input and output variables
             variables = node.inputs + node.outputs
             variable_names = (["INPUT_%i" % i for i in range(len(node.inputs))] +
-                              ["OUTPUT_%i" % i for i in range(len(node.outputs))])
+                              ["OUTPUT_%i" % i for i in range(len(node.inputs))])
 
             # Generate dtype macros
             for i, v in enumerate(variables):
